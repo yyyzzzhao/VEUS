@@ -2,7 +2,8 @@ import os
 import torch
 from collections import OrderedDict
 from abc import ABC, abstractmethod
-from . import networks
+from networks import *
+from util import *
 
 
 class BaseModel(ABC):
@@ -34,8 +35,7 @@ class BaseModel(ABC):
         self.isTrain = opt.isTrain
         self.device = torch.device('cuda:{}'.format(self.gpu_ids[0])) if self.gpu_ids else torch.device('cpu')  # get device name: CPU or GPU
         self.save_dir = os.path.join(opt.checkpoints_dir, opt.name)  # save all the checkpoints to save_dir
-        if opt.preprocess != 'scale_width':  # with [scale_width], input images might have different sizes, which hurts the performance of cudnn.benchmark.
-            torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = True
         self.loss_names = []
         self.model_names = []
         self.visual_names = []
@@ -82,11 +82,11 @@ class BaseModel(ABC):
             opt (Option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions
         """
         if self.isTrain:
-            self.schedulers = [networks.get_scheduler(optimizer, opt) for optimizer in self.optimizers]
-        if not self.isTrain or opt.continue_train:
-            load_suffix = 'iter_%d' % opt.load_iter if opt.load_iter > 0 else opt.epoch
+            self.schedulers = [get_scheduler(optimizer, opt) for optimizer in self.optimizers]
+        if not self.isTrain:
+            load_suffix = 'iter_%d' % opt.epoch
             self.load_networks(load_suffix)
-        self.print_networks(opt.verbose)
+        self.print_networks(True)
 
     def eval(self):
         """Make models eval mode during test time"""
@@ -261,7 +261,7 @@ class EnhanceGANModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['GA_GAN', 'GT_GAN', 'G_L1', 'D_A', 'D_T', 'color_match']
+        self.loss_names = ['GA_GAN', 'GT_GAN', 'G_L1', 'D_A', 'D_T']
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
         self.visual_names = ['real_A', 'fake_B', 'real_B', 'real_AT', 'real_BT', 'fake_BT']
         # specify the models you want to save to the disk. The training/test scripts will call <BaseModel.save_networks> and <BaseModel.load_networks>
@@ -270,28 +270,26 @@ class EnhanceGANModel(BaseModel):
         else:  # during test time, only load G
             self.model_names = ['G']
         # define networks (both generator and discriminator)
-        self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+        self.netG = UnetGenerator(1, 3, 8, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=True)
+        self.netG = init_net(self.netG, gpu_ids=opt.gpu_ids)
 
         if self.isTrain:  # define a discriminator; conditional GANs need to take both input and output images; Therefore, #channels for D is input_nc + output_nc
-            self.netDA = networks.define_D(opt.input_nc + opt.output_nc, opt.ndf, opt.netD,
-                                          opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+            self.netDA = NLayerDiscriminator(1 + 3, 64, 3, norm_layer=nn.BatchNorm2d)
+            self.netDA = init_net(self.netDA, gpu_ids=opt.gpu_ids)
+
             if self.opt.EnhanceT:
-                self.netDT = networks.define_D(opt.input_nc + opt.output_nc, opt.ndf, opt.netD,
-                                          opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+                self.netDT = NLayerDiscriminator(1 + 3, 64, 3, norm_layer=nn.BatchNorm2d)
+                self.netDT = init_net(self.netDT, gpu_ids=opt.gpu_ids)
 
         if self.isTrain:
             # define loss functions
-            self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
+            self.criterionGAN = GANLoss('vanilla').to(self.device)
             self.criterionL1 = torch.nn.L1Loss()
-            if not opt.no_vgg_loss:
-                self.criterionVGG = networks.VGGLoss().to(self.device)
-                self.loss_names.append('indentity_preserving')
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
-            self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-            self.optimizer_DA = torch.optim.Adam(self.netDA.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+            self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(0.5, 0.999))
+            self.optimizer_DA = torch.optim.Adam(self.netDA.parameters(), lr=opt.lr, betas=(0.5, 0.999))
             if self.opt.EnhanceT:
-                self.optimizer_DT = torch.optim.Adam(self.netDT.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+                self.optimizer_DT = torch.optim.Adam(self.netDT.parameters(), lr=opt.lr, betas=(0.5, 0.999))
                 self.optimizers.append(self.optimizer_DT)
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_DA)
@@ -307,28 +305,19 @@ class EnhanceGANModel(BaseModel):
 
         The option 'direction' can be used to swap images in domain A and domain B.
         """
-        AtoB = self.opt.direction == 'AtoB'
+        AtoB = True
         self.real_A = input['A' if AtoB else 'B'].to(self.device)
         self.real_B = input['B' if AtoB else 'A'].to(self.device)
         self.mask = input['M']
-        self.bbox = input['bbox'].numpy()[0]  # (y0, x0, y1, x1)
-        self.cluster = input['Spixel']
-        self.image_paths = input['A_paths' if AtoB else 'B_paths']
-        # add hard-code values for default dic for real B
-        if self.opt.ColorMatch:
-            index = input['index']
-            if str(index) not in self.real_backup: # update dic
-                self.real_backup[str(index)] = cal_color_vector(self.real_A, self.cluster)
-            self.color_real_vec = self.real_backup[str(index)]
-
+        self.bbox = input['bbox'][0]  # (y0, x0, y1, x1)
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.fake_B = self.netG(self.real_A)  # G(A)
         # crop tumor area
-        self.real_AT = self.real_A[:, :, self.bbox[0] : self.bbox[2], self.bbox[1] : self.bbox[3]]
-        self.real_BT = self.real_B[:, :, self.bbox[0] : self.bbox[2], self.bbox[1] : self.bbox[3]]
-        self.fake_BT = self.fake_B[:, :, self.bbox[0] : self.bbox[2], self.bbox[1] : self.bbox[3]]
+        self.real_AT = self.real_A[:, :, self.bbox[0]: self.bbox[2], self.bbox[1]: self.bbox[3]]
+        self.real_BT = self.real_B[:, :, self.bbox[0]: self.bbox[2], self.bbox[1]: self.bbox[3]]
+        self.fake_BT = self.fake_B[:, :, self.bbox[0]: self.bbox[2], self.bbox[1]: self.bbox[3]]
 
     def backward_D_basic(self, netD, realA, realB, fakeB):
         """A general caculation of discriminator backward"""
@@ -364,18 +353,10 @@ class EnhanceGANModel(BaseModel):
             pred_fake_AT = self.netDT(fake_ABT)
             self.loss_GT_GAN = self.criterionGAN(pred_fake_AT, True)
         # Second, G(A) = B
-        self.loss_G_L1 = self.criterionL1(self.fake_B, self.real_B) * self.opt.lambda_L1
+        self.loss_G_L1 = self.criterionL1(self.fake_B, self.real_B) * 100
         # combine loss and calculate gradients
         self.loss_G = self.loss_GA_GAN + self.loss_G_L1 + self.loss_GT_GAN
-        # If there is VGG loss
-        if not self.opt.no_vgg_loss:
-            self.loss_indentity_preserving = self.criterionVGG(self.real_B, self.fake_B) * self.opt.lambda_vgg
-            self.loss_G = self.loss_G + self.loss_indentity_preserving
-        # If use color match loss
-        if self.opt.ColorMatch:
-            self.color_fake_vec = cal_color_vector(self.fake_B, self.cluster)
-            self.loss_color_match = self.criterionL1(self.color_fake_vec, self.color_real_vec) * self.opt.lambda_color
-            self.loss_G = self.loss_G + self.loss_color_match
+
         self.loss_G.backward()
 
     def optimize_parameters(self):

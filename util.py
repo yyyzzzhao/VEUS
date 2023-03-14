@@ -4,8 +4,10 @@ import sys
 import ntpath
 import time
 import cv2
-from . import util, html
+import torch
+from PIL import Image
 from subprocess import Popen, PIPE
+from util import *
 # from scipy.misc import imresize
 
 if sys.version_info[0] == 2:
@@ -34,15 +36,11 @@ def save_images(webpage, visuals, image_path, aspect_ratio=1.0, width=256):
     ims, txts, links = [], [], []
 
     for label, im_data in visuals.items():
-        im = util.tensor2im(im_data)
+        im = tensor2im(im_data)
         image_name = '%s_%s.png' % (name, label)
         save_path = os.path.join(image_dir, image_name)
         h, w, _ = im.shape
-        # if aspect_ratio > 1.0:
-        #     im = imresize(im, (h, int(w * aspect_ratio)), interp='bicubic')
-        # if aspect_ratio < 1.0:
-        #     im = imresize(im, (int(h / aspect_ratio), w), interp='bicubic')
-        util.save_image(im, save_path)
+        save_image(im, save_path)
 
         ims.append(image_name)
         txts.append(label)
@@ -67,24 +65,21 @@ class Visualizer:
         Step 4: create a logging file to store training losses
         """
         self.opt = opt  # cache the option
-        self.display_id = opt.display_id
-        self.use_html = opt.isTrain and not opt.no_html
-        self.win_size = opt.display_winsize
+        self.display_id = 1
+        self.win_size = 256
         self.name = opt.name
-        self.port = opt.display_port
+        self.port = 8097
         self.saved = False
+        self.web_dir = os.path.join(opt.checkpoints_dir, opt.name, 'web')
+        self.img_dir = os.path.join(self.web_dir, 'images')
+        mkdirs([self.web_dir, self.img_dir])
         if self.display_id > 0:  # connect to a visdom server given <display_port> and <display_server>
             import visdom
-            self.ncols = opt.display_ncols
-            self.vis = visdom.Visdom(server=opt.display_server, port=opt.display_port, env=opt.display_env)
+            self.ncols = 4
+            self.vis = visdom.Visdom(server='http://localhost', port=8097, env='main')
             if not self.vis.check_connection():
                 self.create_visdom_connections()
 
-        if self.use_html:  # create an HTML object at <checkpoints_dir>/web/; images will be saved under <checkpoints_dir>/web/images/
-            self.web_dir = os.path.join(opt.checkpoints_dir, opt.name, 'web')
-            self.img_dir = os.path.join(self.web_dir, 'images')
-            print('create web directory %s...' % self.web_dir)
-            util.mkdirs([self.web_dir, self.img_dir])
         # create a logging file to store training losses
         self.log_name = os.path.join(opt.checkpoints_dir, opt.name, 'loss_log.txt')
         with open(self.log_name, "a") as log_file:
@@ -126,7 +121,7 @@ class Visualizer:
                 images = []
                 idx = 0
                 for label, image in visuals.items():
-                    image_numpy = util.tensor2im(image)
+                    image_numpy = tensor2im(image)
                     # print(image_numpy.shape)
                     if not image_numpy.shape[:2] == (h, w):
                         image_numpy = cv2.resize(image_numpy, (w, h))
@@ -156,35 +151,18 @@ class Visualizer:
                 idx = 1
                 try:
                     for label, image in visuals.items():
-                        image_numpy = util.tensor2im(image)
+                        image_numpy = tensor2im(image)
                         self.vis.image(image_numpy.transpose([2, 0, 1]), opts=dict(title=label),
                                        win=self.display_id + idx)
                         idx += 1
                 except VisdomExceptionBase:
                     self.create_visdom_connections()
 
-        if self.use_html and (save_result or not self.saved):  # save images to an HTML file if they haven't been saved.
-            self.saved = True
-            # save images to the disk
-            for label, image in visuals.items():
-                image_numpy = util.tensor2im(image)
-                img_path = os.path.join(self.img_dir, 'epoch%.3d_%s.png' % (epoch, label))
-                util.save_image(image_numpy, img_path)
-
-            # update website
-            webpage = html.HTML(self.web_dir, 'Experiment name = %s' % self.name, refresh=1)
-            for n in range(epoch, 0, -1):
-                webpage.add_header('epoch [%d]' % n)
-                ims, txts, links = [], [], []
-
-                for label, image_numpy in visuals.items():
-                    image_numpy = util.tensor2im(image)
-                    img_path = 'epoch%.3d_%s.png' % (n, label)
-                    ims.append(img_path)
-                    txts.append(label)
-                    links.append(img_path)
-                webpage.add_images(ims, txts, links, width=self.win_size)
-            webpage.save()
+        # save images to the disk
+        for label, image in visuals.items():
+            image_numpy = tensor2im(image)
+            img_path = os.path.join(self.img_dir, 'epoch%.3d_%s.png' % (epoch, label))
+            save_image(image_numpy, img_path)
 
     def plot_current_losses(self, epoch, counter_ratio, losses):
         """display the current losses on visdom display: dictionary of error labels and values
@@ -261,4 +239,101 @@ def extract_bboxes(mask, exp_ratio=1.0):
         x1, x2, y1, y2 = 0, 0, 0, 0
     boxes = np.array([y1, x1, y2, x2])
     return boxes.astype(np.int32)
+
+
+def tensor2im(input_image, imtype=np.uint8):
+    """"Converts a Tensor array into a numpy image array.
+
+    Parameters:
+        input_image (tensor) --  the input image tensor array
+        imtype (type)        --  the desired type of the converted numpy array
+    """
+    if not isinstance(input_image, np.ndarray):
+        if isinstance(input_image, torch.Tensor):  # get the data from a variable
+            image_tensor = input_image.data
+        else:
+            return input_image
+        image_numpy = image_tensor[0].cpu().float().numpy()  # convert it into a numpy array
+        if image_numpy.shape[0] == 1:  # grayscale to RGB
+            image_numpy = np.tile(image_numpy, (3, 1, 1))
+        image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+    else:  # if it is a numpy array, do nothing
+        image_numpy = input_image
+    return image_numpy.astype(imtype)
+
+
+def save_image(image_numpy, image_path):
+    """Save a numpy image to the disk
+
+    Parameters:
+        image_numpy (numpy array) -- input numpy array
+        image_path (str)          -- the path of the image
+    """
+    image_pil = Image.fromarray(image_numpy)
+    image_pil.save(image_path)
+
+
+def mkdirs(paths):
+    """create empty directories if they don't exist
+
+    Parameters:
+        paths (str list) -- a list of directory paths
+    """
+    if isinstance(paths, list) and not isinstance(paths, str):
+        for path in paths:
+            mkdir(path)
+    else:
+        mkdir(paths)
+
+
+def mkdir(path):
+    """create a single empty directory if it didn't exist
+
+    Parameters:
+        path (str) -- a single directory path
+    """
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+def index_closest(pixel, bar):
+    n = len(bar)           #  bar:     =====================
+    temp = []              #           n           ^       0
+    for i in range(n):     #  index:               |
+        dis = sum(list(map(lambda x: abs(x[0]-x[1]), zip(pixel, bar[i]))))
+        temp.append(dis)
+    value = n - temp.index(min(temp))
+    return value
+
+
+def cal_color_vector(color_img, cluster):
+    """ Caculate hard-code strain ratio according cluster"""
+    color_bar = [[0, 0, 143], [0, 0, 159],[0, 0, 175] ,[0, 0, 191] ,[0, 0, 207] ,[0, 0, 223] ,[0, 0, 239] ,[0, 0, 255] ,
+                [0, 16, 255],[0, 32, 255],[0, 48, 255],[0, 64, 255],[0, 80, 255],[0, 96, 255],[0, 112, 255],[0, 128, 255],
+                [0, 143, 255],[0, 159, 255],[0, 175, 255],[0, 191, 255],[0, 207, 255],[0, 223, 255],[0, 239, 255],[0, 255, 255],
+                [16, 255, 239],[32, 255, 223],[48, 255, 207],[64, 255, 191],[80, 255, 175],[96, 255, 159],[112, 255, 143],[128, 255, 128],
+                [143, 255, 112],[159, 255, 96],[175, 255, 80],[191, 255, 64],[207, 255, 48],[223, 255, 32],[239, 255, 16],[255, 255, 0],
+                [255, 239, 0],[255, 223, 0],[255, 207, 0],[255, 191, 0],[255, 175, 0],[255, 159, 0],[255, 143, 0],[255, 128, 0],
+                [255, 112, 0],[255, 96, 0],[255, 80, 0],[255, 64, 0],[255, 48, 0],[255, 32, 0],[255, 16, 0],[255, 0, 0],
+                [239, 0, 0],[223, 0, 0],[207, 0, 0],[191, 0, 0],[175, 0, 0],[159, 0, 0],[143, 0, 0],[128, 0, 0]]
+    color_img = np.squeeze(color_img)
+    cluster = np.squeeze(cluster)  # shape (1, 1, 256, 256)
+    num = torch.max(cluster) + 1   # number clusters
+    vec = []
+    print(num)
+    for i in range(num):
+        values = 0
+        XYs = torch.nonzero(cluster == i)  # tuple (Xs, Ys)
+        n = XYs.size()[0]  # the number of nonzero value
+        if n > 0:
+            for j in range(n):
+                # print(j)
+                pixel = color_img[:, XYs[j, 0], XYs[j, 1]]
+                value = index_closest(pixel, color_bar)
+                values += value
+            vec.append(values / n)
+        else:
+            vec.append(0)
+    return vec
+
 

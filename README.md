@@ -17,17 +17,25 @@ If you find this work useful in your research, please cite
 
 !['paper abstract'](thumbnail/abstract.png )
 
-## Getting start
+### Prerequisites
 
 * python=3.6
 * pytorch=1.10.0
 * CUDA= 10.2
-* torchvision
-* cv2
+* torchvision=0.11.1
+* other dependencies (e.g., visdom, dominate)
 
-### Prerequisites
+## Getting start
+
+* clone this repository:
+```
+git clone git@github.com:yyyzzzhao/VEUS.git
+```
 
 ### Usage
+```
+python train.py
+```
 
 We partially borrowed the [Pix2pix](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix) model for this project, many thanks to the author.
 
